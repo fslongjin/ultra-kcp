@@ -1,9 +1,21 @@
 use std::any::Any;
 
 use crate::constants::{
-    KcpError, KcpProbeFlags, IKCP_DEADLINK, IKCP_FASTACK_LIMIT, IKCP_INTERVAL, IKCP_MTU_DEF,
-    IKCP_OVERHEAD, IKCP_RTO_DEF, IKCP_RTO_MIN, IKCP_THRESH_INIT, IKCP_WND_RCV, IKCP_WND_SND,
+    KcpError, KcpLogFlags, KcpProbeFlags, IKCP_DEADLINK, IKCP_FASTACK_LIMIT, IKCP_INTERVAL,
+    IKCP_MTU_DEF, IKCP_OVERHEAD, IKCP_RTO_DEF, IKCP_RTO_MIN, IKCP_THRESH_INIT, IKCP_WND_RCV,
+    IKCP_WND_SND,
 };
+
+macro_rules! ikcp_log {
+    ($kcp: expr, $mask:expr, $($arg:tt)+) => {
+        if $kcp.canlog($mask) {
+            let s = format!($($arg)*);
+            $kcp.__log(s);
+        }
+
+    }
+
+}
 
 #[derive(Default)]
 pub struct KcpControl {
@@ -64,7 +76,6 @@ pub struct KcpControl {
     pub interval: u32,
     pub ts_flush: u32,
     pub xmit: u32,
-    pub nrcv_buf: u32,
     pub nsnd_buf: u32,
     pub nodelay: u32,
     pub updated: u32,
@@ -84,6 +95,9 @@ pub struct KcpControl {
     pub ackcount: u32,
     pub ackblock: u32,
     pub fastresend: i32,
+    /// Enable logging.
+    write_log: bool,
+    log_mask: KcpLogFlags,
     /// Fast ACK threshold for triggering fast retransmit.
     ///
     /// When receiving this number of duplicate ACKs, KCP will trigger fast retransmit
@@ -96,7 +110,7 @@ pub struct KcpControl {
     /// congestion control. Useful for latency-sensitive applications that
     /// can tolerate packet loss. Default is `false` (congestion control enabled).
     pub nocwnd: bool,
-    pub stream: i32,
+    pub streaming_mode: bool,
     pub callback: Option<Box<dyn KcpCallBack>>,
     user_data: Option<Box<dyn Any>>,
     buffer: Vec<u8>,
@@ -184,6 +198,8 @@ impl KcpControl {
 
     /// Receive data from KCP protocol
     ///
+    /// user/upper level interface
+    ///
     /// # Arguments
     /// * `data` - Optional mutable buffer to store received data
     /// * `is_peek` - If true, only peek data without removing from queue
@@ -215,7 +231,7 @@ impl KcpControl {
 
         let mut copy_offset = 0;
 
-        // Process segments in receive queue
+        // merge fragments in receive queue
         let mut i = 0;
         while i < self.rcv_queue.len() {
             let seg = &self.rcv_queue[i];
@@ -230,7 +246,7 @@ impl KcpControl {
             total_len += seg.len as usize;
             let is_last_fragment = seg.frg == 0;
 
-            // todo: 添加日志
+            ikcp_log!(self, KcpLogFlags::DATA_RECV, "recv sn={}", seg.sn);
 
             if !is_peek {
                 self.rcv_queue.remove(i);
@@ -249,7 +265,6 @@ impl KcpControl {
             let seg = &self.rcv_buf[0];
             if seg.sn == self.rcv_nxt {
                 let seg = self.rcv_buf.remove(0);
-                self.nrcv_buf -= 1;
                 self.rcv_queue.push(seg);
                 self.rcv_nxt += 1;
             } else {
@@ -266,6 +281,134 @@ impl KcpControl {
         }
 
         Ok(total_len)
+    }
+
+    /// Send data through KCP protocol
+    ///
+    /// # Arguments
+    /// * `data` - The data buffer to be sent
+    ///
+    /// # Returns
+    /// - Ok(usize): Number of bytes successfully sent
+    /// - Err(KcpError::WindowFull): When data exceeds receive window size
+    ///
+    /// # Note
+    /// This method handles both streaming and packet mode, with flow control
+    pub fn send(&mut self, data: &[u8]) -> Result<usize, KcpError> {
+        assert!(self.mss > 0);
+
+        let mut data_ptr = data;
+        let mut sent = 0;
+        let mut count;
+
+        // In streaming mode, try to append data to the last segment if possible
+        if self.streaming_mode {
+            if !self.snd_queue.is_empty() {
+                let seg = self.snd_queue.last_mut().unwrap();
+                if seg.len < self.mss {
+                    let capacity = (self.mss - seg.len) as usize;
+                    let extend = if data.len() < capacity {
+                        data.len()
+                    } else {
+                        capacity
+                    };
+
+                    // Append data to existing segment
+                    seg.data.extend_from_slice(&data[..extend]);
+                    data_ptr = &data[extend..];
+                    seg.len += extend as u32;
+                    seg.frg = 0; // Mark as non-fragmented in streaming mode
+
+                    sent = extend;
+                }
+            }
+
+            // Return early if all data was appended to existing segment
+            if data_ptr.len() == 0 {
+                return Ok(sent);
+            }
+        }
+
+        // Calculate number of segments needed for remaining data
+        if data_ptr.len() <= self.mss as usize {
+            count = 1; // Single segment
+        } else {
+            // Round up division to get total segments needed
+            count = (data_ptr.len() + self.mss as usize - 1) / self.mss as usize;
+        }
+
+        // Check if total segments exceed receive window size
+        if count >= self.recv_window as usize {
+            // In streaming mode, return partial success if some data was sent
+            if self.streaming_mode && sent > 0 {
+                return Ok(sent);
+            }
+
+            // Return error if window is full and no data was sent
+            return Err(KcpError::WindowFull);
+        }
+
+        // Ensure at least one segment will be created
+        if count == 0 {
+            count = 1;
+        }
+
+        // Split remaining data into segments and add to send queue
+        for i in 0..count {
+            // Determine segment size (either MSS or remaining data size)
+            let size = if data_ptr.len() > self.mss as usize {
+                self.mss as usize
+            } else {
+                data_ptr.len()
+            };
+
+            // Create new segment with calculated size
+            let mut seg = Segment::new(size);
+
+            // Copy data to segment if there's data remaining
+            if data_ptr.len() > 0 {
+                seg.data[..size].copy_from_slice(&data_ptr[..size]);
+            }
+
+            // Set segment length
+            seg.len = size as u32;
+
+            // Set fragment number (only in non-streaming mode)
+            seg.frg = if !self.streaming_mode {
+                // Fragments are numbered in reverse order (last fragment is 0)
+                (count - i - 1) as u32
+            } else {
+                // No fragmentation in streaming mode
+                0
+            };
+
+            // Add segment to send queue
+            self.snd_queue.push(seg);
+
+            // Advance data pointer
+            data_ptr = &data_ptr[size..];
+
+            // Update total bytes sent
+            sent += size;
+        }
+
+        // Return total bytes successfully queued for sending
+        return Ok(sent);
+    }
+
+    pub fn set_logging(&mut self, enable: bool) {
+        self.write_log = enable;
+    }
+    pub fn set_log_mask(&mut self, mask: KcpLogFlags) {
+        self.log_mask = mask;
+    }
+
+    pub const fn log_mask(&self) -> &KcpLogFlags {
+        &self.log_mask
+    }
+
+    pub const fn write_log(&self) -> bool {
+        self.write_log
     }
 
     /// Get the size of next message in receive queue without removing it
@@ -305,6 +448,20 @@ impl KcpControl {
 
         Ok(total_len)
     }
+
+    fn __log(&self, s: String) {
+        if let Some(ref callback) = self.callback {
+            callback.writelog(&s, self, self.user_data.as_ref());
+        }
+    }
+
+    /// Check if logging is enabled and the log mask matches the specified log flags
+    ///
+    /// # Arguments
+    /// * `mask` - The log flags to check against
+    fn canlog(&self, mask: KcpLogFlags) -> bool {
+        self.log_mask.intersects(mask) && self.write_log && self.callback.is_some()
+    }
 }
 
 /// Callback trait for KCP protocol events
@@ -334,9 +491,10 @@ pub trait KcpCallBack: Send + Sync {
     ///
     /// # Note
     /// This is optional and can be left unimplemented if logging is not needed.
-    fn writelog(&self, log: &str, kcp: &mut KcpControl, user: Option<&Box<dyn Any>>) {}
+    fn writelog(&self, log: &str, kcp: &KcpControl, user: Option<&Box<dyn Any>>) {}
 }
 
+#[derive(Clone, Default)]
 pub struct Segment {
     pub conv: u32,
     pub cmd: u32,
@@ -351,4 +509,12 @@ pub struct Segment {
     pub fastack: u32,
     pub xmit: u32,
     pub data: Vec<u8>, // Using Vec<u8> to represent the flexible array member `char data[1]`
+}
+
+impl Segment {
+    pub fn new(data_size: usize) -> Self {
+        let mut x = Self::default();
+        x.data.resize(data_size, 0);
+        x
+    }
 }

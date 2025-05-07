@@ -99,4 +99,36 @@ pub enum KcpError {
     BufferTooSmall,
     /// Message fragments are incomplete
     IncompleteMessage,
+    /// Window size is too small to hold the data
+    WindowFull,
+}
+
+bitflags! {
+    #[derive(Default)]
+    pub struct KcpLogFlags: u32 {
+        /// Enable basic output logging
+        const OUTPUT = 1 << 0;
+        /// Enable basic input logging
+        const INPUT = 1 << 1;
+        /// Log outgoing data segments
+        const DATA_SEND = 1 << 2;
+        /// Log incoming data segments
+        const DATA_RECV = 1 << 3;
+        /// Log incoming data packets
+        const IN_DATA = 1 << 4;
+        /// Log incoming ACK packets
+        const IN_ACK = 1 << 5;
+        /// Log incoming window probe requests
+        const IN_PROBE = 1 << 6;
+        /// Log incoming window size updates
+        const IN_WINS = 1 << 7;
+        /// Log outgoing data packets
+        const OUT_DATA = 1 << 8;
+        /// Log outgoing ACK packets
+        const OUT_ACK = 1 << 9;
+        /// Log outgoing window probe requests
+        const OUT_PROBE = 1 << 10;
+        /// Log outgoing window size updates
+        const OUT_WINS = 1 << 11;
+    }
 }
