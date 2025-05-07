@@ -1,4 +1,3 @@
 [workspace]
-members = [
-    "ultra-kcp-core",
-]
+resolver = "2"
+members = ["ultra-kcp-core"]
